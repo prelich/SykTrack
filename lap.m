@@ -371,7 +371,11 @@ y = y(2:end);
 
 
 % I just modified ismember to be a lot faster, less overhead for me.  -PKR
-mark1 = ismember([colIdx rowIdx],[(1:length(x))' x],'rows','legacy');
+%mark1 = ismember([colIdx rowIdx],[(1:length(x))' x],'rows','legacy');
+% using MATLAB's built in C function for ismember - PKR
+% https://www.mathworks.com/matlabcentral/answers/362036-search-for-elements-of-a-vector-in-a-matrix-without-using-ismember
+mark1 = find(builtin('_ismemberhelper', colIdx, (1:length(x))') & ...
+     builtin('_ismemberhelper', rowIdx, x));
 
 %mark2 = (colIdx(mark1) == y);
 Ass_cost = (val(mark1));

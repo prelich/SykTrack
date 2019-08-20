@@ -1,7 +1,7 @@
 classdef PTrack < handle
     %Pablo Track Basic Coordinate Tracking class
     %   Bayesian Tracking with Filters and variable Box Sizes
-    %   Peter Relich August 2017, UPENN
+    %   Peter Relich August 2017 and August 2019, UPENN
     %   Peter Relich June 2016, UNM
     %   Mark J. Olah (mjo@cs.unm.edu) 2015, UNM
     properties (Constant=true, Hidden=true)
@@ -30,7 +30,7 @@ classdef PTrack < handle
         MinEv = 0.01; % value for the evidence, birth death cost experiment if no prior data exists
         Beta_0 = 0.23; % initial beta value for the diffusion prior
         Alpha_0 = 3; % initial alpha value for the diffusion prior 
-        MinAlpha = 2; % minimum alpha value for relaxation of posteriors
+        MinAlpha = 3; % minimum alpha value for relaxation of posteriors
         TAlpha = 0.99; % minimum emitter probability for track survival
         % flag to use the Lambert function to reduce priors if they become to overinformative.
         Lambert = true;
@@ -645,13 +645,8 @@ classdef PTrack < handle
             HyperPriors{2} = zeros(lenprior,size(obj.Inter_map,1));
             poscol = cell2mat(values(obj.Col_id,{'X','Y','FrameIdx','X_SE','Y_SE','emitter','fake'}));
             Coords = cell(2,1);
-            for mm=1:lenprior % get hyper prior array for start points
-                stid=glonStart.LocIdx(mm);
-                Coords{2}(mm,:) = obj.Position(stid,poscol);
-               
-                enid= globEnd.LocIdx(mm); % get the actual matrix index
-                Coords{1}(mm,:) = obj.Position(enid,poscol);
-            end
+            Coords{2} = obj.Position(glonStart.LocIdx,poscol);
+            Coords{1} = obj.Position(globEnd.LocIdx,poscol);
             % make a link vector of non-connected tracks
             nonLinks = (2*lenprior:-1:1)'; % nothing will connect!
             % pull out segmented links prior to all connections
@@ -763,15 +758,16 @@ classdef PTrack < handle
             % build death matrix
             dM = obj.interDeath(tempEnd,tempHyperPriors);
             % build conenction matrix
-            cM = obj.interConnect(tempStart,tempEnd,tempCoords,tempHyperPriors);
-            cM = sparse(cM);
-            bM = sparse(bM);
-            dM = sparse(dM);
+            [Vm, Rm, Cm] = obj.interConnect(tempStart,tempEnd,tempCoords,tempHyperPriors);
             % Make sure that there are no negative values
-            minEv = min([min(min(cM)), min(min(dM)), min(min(bM))]);
+            minEv = min([min(Vm), min(dM), min(bM)]);
             bM(bM~=0) = bM(bM~=0) - minEv + eps;
             dM(dM~=0) = dM(dM~=0) - minEv + eps;
-            cM(cM~=0) = cM(cM~=0) - minEv + eps;
+            Vm(Vm~=0) = Vm(Vm~=0) - minEv + eps;
+            % convert values to sparse
+            cM = sparse(Rm,Cm,Vm,length(dM),length(bM));
+            bM = sparse(1:length(bM),1:length(bM),bM);
+            dM = sparse(1:length(dM),1:length(dM),dM);
             % build junk LR matrix
             jM = (cM>0)';
             jM = jM*eps; % minimize impact of costs with a small number
@@ -784,27 +780,34 @@ classdef PTrack < handle
         end
         
         function bM = interBirth(obj,tempStart,HyperPriors)
-            stTmp = min(obj.MaxFrameGap,tempStart.FrameIdx-1); % put track starts at base 0
+            %stTmp = min(obj.MaxFrameGap,tempStart.FrameIdx-1); % put track starts at base 0
 %             % Calculate loss at expected minEv from all priors
                 beta_s = HyperPriors{2}(:,obj.Inter_map('beta0'));
                 alpha_s = HyperPriors{2}(:,obj.Inter_map('alpha0'));
                 loss = log(beta_s./alpha_s + eps) - (1+1./alpha_s)*log(obj.MinEv);
                 loss(isinf(loss)) = -log(obj.MinEv);
-                bM = diag(loss);
+                bM = loss;
         end
         
         function dM = interDeath(obj,tempEnd,HyperPriors)
-            enTmp = min(obj.MaxFrameGap,obj.FrameEnd - tempEnd.FrameIdx); % figure out gap lengths from track ends
+            %enTmp = min(obj.MaxFrameGap,obj.FrameEnd - tempEnd.FrameIdx); % figure out gap lengths from track ends
 %             % Calculate loss at expected minEv from all priors
                 beta_e = HyperPriors{1}(:,obj.Inter_map('beta0'));
                 alpha_e = HyperPriors{1}(:,obj.Inter_map('alpha0'));
                 loss = log(beta_e./alpha_e + eps) - (1+1./alpha_e)*log(obj.MinEv);
                 loss(isinf(loss)) = -log(obj.MinEv);
-                dM = diag(loss);
+                dM = loss;
         end
         
-        function cM = interConnect(obj,tempStart,tempEnd,Coords,HyperPriors)
-            cM = zeros(length(tempEnd.FrameIdx),length(tempStart.FrameIdx)); % initialize connection matrix
+        function [Vm, Rm, Cm] = interConnect(obj,tempStart,tempEnd,Coords,HyperPriors)
+            %cM = zeros(length(tempEnd.FrameIdx),length(tempStart.FrameIdx)); % initialize connection matrix
+            % initialize connection matrix as a sparse with 3 columns
+            % pre-initialize with 2 N log N tracks
+            preAlloc = ceil(2*length(tempStart.FrameIdx)*log(length(tempStart.FrameIdx)));
+            Vm = zeros(preAlloc,1);
+            Rm = zeros(preAlloc,1);
+            Cm = zeros(preAlloc,1);
+            counter = 1;
             % This is a double for loop for now
             log2pi = log(2*pi);
             poscol = [1,2]; % this was defined in generateInterHypers
@@ -815,8 +818,8 @@ classdef PTrack < handle
             for mm=1:length(tempStart.FrameIdx)
                 %vectorized temporal cuttoffs
                 dT = tempStart.FrameIdx(mm)-tempEnd.FrameIdx;
-                temporally_feasible = find(dT>0 & dT<obj.MaxFrameGap);
-                Ntemporally_feasible = numel(temporally_feasible);
+                temporally_feasible = dT>0 & dT<obj.MaxFrameGap;
+                Ntemporally_feasible = sum(temporally_feasible);
                 if Ntemporally_feasible == 0
                     continue;
                 end
@@ -828,7 +831,8 @@ classdef PTrack < handle
                 % get the relative diffusion evidence from a Jeffreys prior on diffusion
                 Jevidence = 4*deltaT./(sum(sqdisp,2)+0.01); 
                 spatially_feasible = Jevidence>=obj.MinEv;
-                feasible = temporally_feasible(spatially_feasible);
+                feasible = temporally_feasible;
+                feasible(temporally_feasible) = spatially_feasible;
                 if isempty(feasible)
                     continue;
                 end
@@ -847,9 +851,8 @@ classdef PTrack < handle
                 beta0_s = HyperPriors{2}(mm,hypercol(7))+eps;
                 alpha0_s = HyperPriors{2}(mm,hypercol(8))+eps;
                 fs = HyperPriors{2}(mm,hypercol(9));
-                for ii = 1:numel(feasible)
-                    nn = feasible(ii);
-                    % load forward prior for track end
+                % load forward prior for track end
+                nn = find(feasible); % removed for loop in favor of vectorization
                     Xe = Coords{1}(nn,poscol(1));
                     Ye = Coords{1}(nn,poscol(2));
                     Te = Coords{1}(nn,timecol);
@@ -863,37 +866,45 @@ classdef PTrack < handle
                     alpha0_e = HyperPriors{1}(nn,hypercol(8))+eps;
                     fe = HyperPriors{1}(nn,hypercol(9));
                     % combine the hyper priors!
-                    Gamx = (Gamx_s*Gamx_e)/(Gamx_s+Gamx_e);
-                    Gamy = (Gamy_s*Gamy_e)/(Gamy_s+Gamy_e);
+                    Gamx = (Gamx_s.*Gamx_e)./(Gamx_s+Gamx_e);
+                    Gamy = (Gamy_s.*Gamy_e)./(Gamy_s+Gamy_e);
                     DelT = Ts-Te;
-                    Vx = (Vx_e*Gamx_s+Vx_s*Gamx_e)/(Gamx_s+Gamx_e);
-                    Vy = (Vy_e*Gamy_s+Vy_s*Gamy_e)/(Gamy_s+Gamy_e);
+                    Vx = (Vx_e.*Gamx_s+Vx_s.*Gamx_e)./(Gamx_s+Gamx_e);
+                    Vy = (Vy_e.*Gamy_s+Vy_s.*Gamy_e)./(Gamy_s+Gamy_e);
                     alpha = alpha_e+alpha_s+eps;
                     beta = beta_e+beta_s+eps;
-                    Qx = 2*DelT*(1+DelT*Gamx);
-                    Qy = 2*DelT*(1+DelT*Gamy);
-                    bx = ((Xs-Xe-Vx*DelT)^2)/Qx/2;
-                    by = ((Ys-Ye-Vy*DelT)^2)/Qy/2;
-                    bxz = ((Xs-Xe)^2)/4/DelT;
-                    byz = ((Ys-Ye)^2)/4/DelT;
+                    Qx = 2*DelT.*(1+DelT.*Gamx);
+                    Qy = 2*DelT.*(1+DelT.*Gamy);
+                    bx = ((Xs-Xe-Vx.*DelT).^2)./Qx/2;
+                    by = ((Ys-Ye-Vy.*DelT).^2)./Qy/2;
+                    bxz = ((Xs-Xe).^2)/4./DelT;
+                    byz = ((Ys-Ye).^2)/4./DelT;
                     alphaz = alpha0_e+alpha0_s+eps;
                     betaz = beta0_e+beta0_s+eps;
                     % cost with a drifting particle
-                    Ecost = -alpha*log(beta+eps)-log(alpha+eps)...
-                        +(alpha+1)*log(beta+bx+by+eps) +.5*log(Qx*Qy) ...
-                        + log2pi - (deltaT(ii)-1)*log(obj.MissProb) ...
+                    Ecost = -alpha.*log(beta+eps)-log(alpha+eps)...
+                        +(alpha+1).*log(beta+bx+by+eps) +.5*log(Qx.*Qy) ...
+                        + log2pi - (deltaT-1)*log(obj.MissProb) ...
                         -log(1-obj.FakePlausible*fe)-log(1-obj.FakePlausible*fs);
                     % cost with a purely diffusive particle
-                    Scost = -alphaz*log(betaz+eps)-log(alphaz+eps)...
-                        +(alphaz+1)*log(betaz+bxz+byz+eps) + log(2*DelT) ...
-                        + log2pi - (deltaT(ii)-1)*log(obj.MissProb) ...
+                    Scost = -alphaz.*log(betaz+eps)-log(alphaz+eps)...
+                        +(alphaz+1).*log(betaz+bxz+byz+eps) + log(2*DelT) ...
+                        + log2pi - (deltaT-1)*log(obj.MissProb) ...
                         -log(1-obj.FakePlausible*fe)-log(1-obj.FakePlausible*fs);
                     cost = min(Scost,Ecost);
                     if cost == 0
                         cost = eps;
                     end
-                    cM(nn,mm) = cost;
-                end
+                    Vm(counter:counter+length(nn)-1) = cost;
+                    Rm(counter:counter+length(nn)-1) = nn;
+                    Cm(counter:counter+length(nn)-1) = mm;
+                    counter = counter+length(nn);
+            end
+            % remove unused elements
+            if counter < preAlloc+1
+                Vm(counter:end) = [];
+                Rm(counter:end) = [];
+                Cm(counter:end) = [];
             end
         end
         
@@ -1049,15 +1060,16 @@ classdef PTrack < handle
             % build death matrix
             dM = obj.gapDeath(Hypers);
             % build conenction matrix
-            cM = obj.gapConnect(NTracks,Hypers,Coords);
-            cM = sparse(cM);
-            bM = sparse(bM);
-            dM = sparse(dM);
+            [Vm, Rm, Cm] = obj.gapConnect(NTracks,Hypers,Coords);
             % Make sure that there are no negative values
-            minEv = min([min(min(cM)), min(min(dM)), min(min(bM))]);
+            minEv = min([min(Vm), min(dM), min(bM)]);
             bM(bM~=0) = bM(bM~=0) - minEv + eps;
             dM(dM~=0) = dM(dM~=0) - minEv + eps;
-            cM(cM~=0) = cM(cM~=0) - minEv + eps;
+            Vm(Vm~=0) = Vm(Vm~=0) - minEv + eps;
+            % convert values to sparse
+            cM = sparse(Rm,Cm,Vm,NTracks,NTracks);
+            bM = sparse(1:length(bM),1:length(bM),bM);
+            dM = sparse(1:length(dM),1:length(dM),dM);
             % build junk LR matrix
             jM = (cM>0)';
             jM = jM*eps; % minimize impact of costs with a small number
@@ -1072,27 +1084,33 @@ classdef PTrack < handle
         %% Lower Level Gap Closing Methods
         % birth matrix for gap closing
         function bM = gapBirth(obj,HyperPriors)
-            stTmp = obj.TrackStartFrameIdx-1; % put track starts at base 0
+            %stTmp = obj.TrackStartFrameIdx-1; % put track starts at base 0
             % ratio of surviors, particle density drops
             beta_e = HyperPriors{2}(:,obj.Inter_map('beta0'));
             alpha_e = HyperPriors{2}(:,obj.Inter_map('alpha0'));
             loss = log(beta_e./alpha_e + eps) -(1+1./alpha_e)*log(obj.MinEv);
             loss(isinf(loss)) = -log(obj.MinEv);
-            bM = diag(loss); % force deaths
+            bM = loss; % force deaths
         end
         % death matrix for gap closing
         function dM = gapDeath(obj,HyperPriors)
             % determine frame size
-            enTmp = obj.Nframes - obj.TrackEndFrameIdx; % figure out gap lengths from track ends
+            %enTmp = obj.Nframes - obj.TrackEndFrameIdx; % figure out gap lengths from track ends
             beta_e = HyperPriors{1}(:,obj.Inter_map('beta0'));
             alpha_e = HyperPriors{1}(:,obj.Inter_map('alpha0'));
             loss = log(beta_e./alpha_e + eps) -(1+1./alpha_e)*log(obj.MinEv);
             loss(isinf(loss)) = -log(obj.MinEv);
-            dM = diag(loss); % force deaths
+            dM = loss; % force deaths
         end
         
-        function cM = gapConnect(obj,NTracks,HyperPriors,Coords)
-            cM = zeros(NTracks); % initialize connection matrix
+        function [Vm, Rm, Cm] = gapConnect(obj,NTracks,HyperPriors,Coords)
+            % initialize connection matrix as a sparse with 3 columns
+            % pre-initialize with 2 N log N tracks
+            preAlloc = ceil(2*NTracks*log(NTracks));
+            Vm = zeros(preAlloc,1);
+            Rm = zeros(preAlloc,1);
+            Cm = zeros(preAlloc,1);
+            counter = 1;
             % This is a double for loop for now
             log2pi = log(2*pi);
             poscol = [1,2]; % this was defined in getGapInputs
@@ -1102,8 +1120,8 @@ classdef PTrack < handle
             for mm=1:NTracks
                 %vectorized temporal cuttoffs
                 dT = obj.TrackStartFrameIdx(mm)-obj.TrackEndFrameIdx;
-                temporally_feasible = find(dT>0 & dT<obj.MaxFrameGap);
-                Ntemporally_feasible = numel(temporally_feasible);
+                temporally_feasible = dT>0 & dT<obj.MaxFrameGap;
+                Ntemporally_feasible = sum(temporally_feasible);
                 if Ntemporally_feasible == 0
                     continue;
                 end
@@ -1115,7 +1133,8 @@ classdef PTrack < handle
                 % get the relative diffusion evidence from a Jeffreys prior on diffusion
                 Jevidence = 4*deltaT./(sum(sqdisp,2)+0.01); % prevent infs
                 spatially_feasible = Jevidence>=obj.MinEv;
-                feasible = temporally_feasible(spatially_feasible);
+                feasible = temporally_feasible;
+                feasible(temporally_feasible) = spatially_feasible;
                 if isempty(feasible)
                     continue;
                 end
@@ -1133,49 +1152,57 @@ classdef PTrack < handle
                 Gamy_s = HyperPriors{2}(mm,hypercol(6));
                 beta0_s = HyperPriors{2}(mm,hypercol(7));
                 alpha0_s = HyperPriors{2}(mm,hypercol(8));
-                for ii = 1:numel(feasible)
-                    nn = feasible(ii);
-                    %compute costMat according to diffusion
-                    % load forward prior for track end
-                    Xe = Coords{1}(nn,poscol(1));
-                    Ye = Coords{1}(nn,poscol(2));
-                    Te = Coords{1}(nn,timecol);
-                    beta_e = HyperPriors{1}(nn,hypercol(1));
-                    alpha_e = HyperPriors{1}(nn,hypercol(2));
-                    Vx_e = HyperPriors{1}(nn,hypercol(3));
-                    Vy_e = HyperPriors{1}(nn,hypercol(4));
-                    Gamx_e = HyperPriors{1}(nn,hypercol(5));
-                    Gamy_e = HyperPriors{1}(nn,hypercol(6));
-                    beta0_e = HyperPriors{1}(nn,hypercol(7));
-                    alpha0_e = HyperPriors{1}(nn,hypercol(8));
-                    % combine the hyper priors!
-                    Gamx = (Gamx_s*Gamx_e)/(Gamx_s+Gamx_e);
-                    Gamy = (Gamy_s*Gamy_e)/(Gamy_s+Gamy_e);
-                    DelT = Ts-Te;
-                    Vx = (Vx_e*Gamx_s+Vx_s*Gamx_e)/(Gamx_s+Gamx_e);
-                    Vy = (Vy_e*Gamy_s+Vy_s*Gamy_e)/(Gamy_s+Gamy_e);
-                    alpha = alpha_e+alpha_s+eps;
-                    beta = beta_e+beta_s+eps;
-                    Qx = 2*DelT*(1+DelT*Gamx);
-                    Qy = 2*DelT*(1+DelT*Gamy);
-                    bx = ((Xs-Xe-Vx*DelT)^2)/Qx/2;
-                    by = ((Ys-Ye-Vy*DelT)^2)/Qy/2;
-                    alphaz = alpha0_e+alpha0_s;
-                    betaz = beta0_e+beta0_s;
-                    bxz = ((Xs-Xe)^2)/4/DelT;
-                    byz = ((Ys-Ye)^2)/4/DelT;
-                    Ecost = -alpha*log(beta+eps)-log(alpha+eps)...
-                        +(alpha+1)*log(beta+bx+by+eps) +.5*log(Qx*Qy) ...
-                        + log2pi - (deltaT(ii)-1)*log(obj.MissProb);
-                    Scost = -alphaz*log(betaz+eps)-log(alphaz+eps)...
-                        +(alphaz+1)*log(betaz+bxz+byz+eps) + log(2*DelT) ...
-                        + log2pi - (deltaT(ii)-1)*log(obj.MissProb);
-                    cost = min(Ecost,Scost);
-                    if cost == 0
-                        cost = eps;
-                    end
-                    cM(nn,mm) = cost;
+                % removed for loop of feasible here in favor of vectorization
+                nn = find(feasible);
+                %compute costMat according to diffusion
+                % load forward prior for track end
+                Xe = Coords{1}(nn,poscol(1));
+                Ye = Coords{1}(nn,poscol(2));
+                Te = Coords{1}(nn,timecol);
+                beta_e = HyperPriors{1}(nn,hypercol(1));
+                alpha_e = HyperPriors{1}(nn,hypercol(2));
+                Vx_e = HyperPriors{1}(nn,hypercol(3));
+                Vy_e = HyperPriors{1}(nn,hypercol(4));
+                Gamx_e = HyperPriors{1}(nn,hypercol(5));
+                Gamy_e = HyperPriors{1}(nn,hypercol(6));
+                beta0_e = HyperPriors{1}(nn,hypercol(7));
+                alpha0_e = HyperPriors{1}(nn,hypercol(8));
+                % combine the hyper priors!
+                Gamx = (Gamx_s.*Gamx_e)./(Gamx_s+Gamx_e);
+                Gamy = (Gamy_s.*Gamy_e)./(Gamy_s+Gamy_e);
+                DelT = Ts-Te;
+                Vx = (Vx_e.*Gamx_s+Vx_s.*Gamx_e)./(Gamx_s+Gamx_e);
+                Vy = (Vy_e.*Gamy_s+Vy_s.*Gamy_e)./(Gamy_s+Gamy_e);
+                alpha = alpha_e+alpha_s+eps;
+                beta = beta_e+beta_s+eps;
+                Qx = 2*DelT.*(1+DelT.*Gamx);
+                Qy = 2*DelT.*(1+DelT.*Gamy);
+                bx = ((Xs-Xe-Vx.*DelT).^2)./Qx/2;
+                by = ((Ys-Ye-Vy.*DelT).^2)./Qy/2;
+                alphaz = alpha0_e+alpha0_s;
+                betaz = beta0_e+beta0_s;
+                bxz = ((Xs-Xe).^2)/4./DelT;
+                byz = ((Ys-Ye).^2)/4./DelT;
+                Ecost = -alpha.*log(beta+eps)-log(alpha+eps)...
+                    +(alpha+1).*log(beta+bx+by+eps) +.5*log(Qx.*Qy) ...
+                    + log2pi - (deltaT-1)*log(obj.MissProb);
+                Scost = -alphaz.*log(betaz+eps)-log(alphaz+eps)...
+                    +(alphaz+1).*log(betaz+bxz+byz+eps) + log(2*DelT) ...
+                    + log2pi - (deltaT-1)*log(obj.MissProb);
+                cost = min(Ecost,Scost);
+                if cost == 0
+                    cost = eps;
                 end
+                Vm(counter:counter+length(nn)-1) = cost;
+                Rm(counter:counter+length(nn)-1) = nn;
+                Cm(counter:counter+length(nn)-1) = mm;
+                counter = counter+length(nn);
+            end
+            % remove unused elements
+            if counter < preAlloc+1
+                Vm(counter:end) = [];
+                Rm(counter:end) = [];
+                Cm(counter:end) = [];
             end
         end
         %% LLR track filtering
@@ -1209,12 +1236,6 @@ classdef PTrack < handle
                 if probVal < obj.TAlpha
                     obj.FauxTracks(ii) = true;
                 end
-%                 % check to see if remaing fit ensemble is good
-%                 mFactor = length(tempLLR);
-%                 mX2 = 1-X2_CDF(mFactor*(k+1),sum(tempLLR));
-%                 if obj.TPVal>mX2
-%                     obj.FauxTracks(ii) = true;
-%                 end
             end
         end
                         
@@ -1300,15 +1321,15 @@ classdef PTrack < handle
             st_grouping{Ntracks} = [];
             % group short tracks together
             count = 1; % start a counter of the grouping matrix
-            remvec = (1:Nsegments)';
-            id = remvec(1); % start with an id here
+            remvec = true(Nsegments,1);
+            id = 1; %remvec(1); % start with an id at 1
             for nn = 1:Nsegments
                 if id > Nsegments
                     count = count+1;
-                    id = remvec(1);
+                    id = find(remvec,1);
                 end
                 st_grouping{count} = [st_grouping{count} id];
-                remvec(remvec == id) = []; % remove chosen id from vector
+                remvec(id) = false; % remove chosen id from vector
                 id = links12(id);
             end
         end
